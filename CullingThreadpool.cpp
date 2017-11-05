@@ -363,6 +363,9 @@ void CullingThreadpool::WakeThreads()
 	// Wait for all threads to be in suspended mode
 	while (mNumSuspendedThreads < mNumThreads)
 		std::this_thread::yield();
+	
+	//Reset work queue (discard anything that is not finished by this point)
+	mRenderQueue->Reset();
 
 	// Send wake up event
 	std::unique_lock<std::mutex> lock(mSuspendedMutex);
