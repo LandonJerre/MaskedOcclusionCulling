@@ -45,7 +45,7 @@
  * balance between performance and low leakage. If QUICK_MASK is defined to 0, use the algorithm from
  * "Masked Depth Culling for Graphics Hardware" which has less leakage, but also lower performance.
  */
-#define QUICK_MASK          1
+#define QUICK_MASK                      1
 
 #endif
 
@@ -54,10 +54,9 @@
  * Configures the library for use with Direct3D (default) or OpenGL rendering. This changes whether the 
  * screen space Y axis points downwards (D3D) or upwards (OGL), and is primarily important in combination 
  * with the PRECISE_COVERAGE define, where this is important to ensure correct rounding and tie-breaker
- * behaviour. It also affects the ScissorRect screen space coordinates and the memory layout of the buffer 
- * returned by ComputePixelDepthBuffer().
+ * behaviour. It also affects the ScissorRect screen space coordinates.
  */
-#define USE_D3D             1
+#define USE_D3D                         1
 
 #endif
 
@@ -66,16 +65,25 @@
  * Define PRECISE_COVERAGE to 1 to more closely match GPU rasterization rules. The increased precision comes
  * at a cost of slightly lower performance.
  */
-#define PRECISE_COVERAGE    0
+#define PRECISE_COVERAGE                1
 
 #endif
 
 #ifndef USE_AVX512
 /*!
- * Define USE_AVX512 to 1 to enable experimental AVX-512 support. It'currently mostly untested and only
+ * Define USE_AVX512 to 1 to enable experimental AVX-512 support. It's currently mostly untested and only
  * validated on simple examples using Intel SDE. Older compilers may not support AVX-512 intrinsics.
  */
-#define USE_AVX512          0
+#define USE_AVX512                      0
+
+#endif
+
+#ifndef CLIPPING_PRESERVES_ORDER
+/*!
+ * Define CLIPPING_PRESERVES_ORDER to 1 to prevent clipping from reordering triangle rasterization
+ * order; This comes at a cost (approx 3-4%) but removes one source of temporal frame-to-frame instability.
+ */
+#define CLIPPING_PRESERVES_ORDER        1
 
 #endif
 
@@ -84,26 +92,36 @@
  * Define ENABLE_STATS to 1 to gather various statistics during occlusion culling. Can be used for profiling 
  * and debugging. Note that enabling this function will reduce performance significantly.
  */
-#define ENABLE_STATS        0
+#define ENABLE_STATS                    0
 
 #endif
 
-#ifndef ENABLE_RECORDER
+#ifndef MOC_RECORDER_ENABLE
 /*!
- * Define ENABLE_RECORDER to 1 to enable frame recorder (see FrameRecorder.h/cpp for details)
+ * Define MOC_RECORDER_ENABLE to 1 to enable frame recorder (see FrameRecorder.h/cpp for details)
  */
-#define ENABLE_RECORDER		0
+#define MOC_RECORDER_ENABLE		        0
 
 #endif
 
+#if MOC_RECORDER_ENABLE
+#ifndef MOC_RECORDER_ENABLE_PLAYBACK
+/*!
+ * Define MOC_RECORDER_ENABLE_PLAYBACK to 1 to enable compilation of the playback code (not needed 
+   for recording)
+ */
+#define MOC_RECORDER_ENABLE_PLAYBACK    0
+#endif
+#endif
 
-#if ENABLE_RECORDER
+
+#if MOC_RECORDER_ENABLE
 
 #include <mutex>
 
 class FrameRecorder;
 
-#endif // #if ENABLE_RECORDER
+#endif // #if MOC_RECORDER_ENABLE
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -224,6 +242,7 @@ public:
 			long long mNumRasterizedTriangles; //!< Number of occluder triangles passing view frustum and backface culling
 			long long mNumTilesTraversed;      //!< Number of tiles traversed by the rasterizer
 			long long mNumTilesUpdated;        //!< Number of tiles where the hierarchical z buffer was updated
+			long long mNumTilesMerged;        //!< Number of tiles where the hierarchical z buffer was updated
 		} mOccluders;
 
 		struct
@@ -242,14 +261,14 @@ public:
 	/*!
 	 * \brief Creates a new object with default state, no z buffer attached/allocated.
 	 */
-	static MaskedOcclusionCulling *Create();
+	static MaskedOcclusionCulling *Create(Implementation RequestedSIMD = AVX512);
 	
 	/*!
 	 * \brief Creates a new object with default state, no z buffer attached/allocated.
 	 * \param alignedAlloc Pointer to a callback function used when allocating memory
 	 * \param alignedFree Pointer to a callback function used when freeing memory
 	 */
-	static MaskedOcclusionCulling *Create(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
+	static MaskedOcclusionCulling *Create(Implementation RequestedSIMD, pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
 
 	/*!
 	 * \brief Destroys an object and frees the z buffer memory. Note that you cannot 
@@ -305,6 +324,11 @@ public:
 	 * \brief Clears the hierarchical depth buffer.
 	 */
 	virtual void ClearBuffer() = 0;
+
+	/*!
+	* \brief Merge a second hierarchical depth buffer into the main buffer.
+	*/
+	virtual void MergeBuffer(MaskedOcclusionCulling* BufferB) = 0;
 
 	/*! 
 	 * \brief Renders a mesh of occluder triangles and updates the hierarchical z buffer
@@ -460,7 +484,7 @@ public:
 	 * \param depthData Pointer to memory where the per-pixel depth data is written. Must
 	 *        hold storage for atleast width*height elements as set by setResolution.
 	 */
-	virtual void ComputePixelDepthBuffer(float *depthData) = 0;
+	virtual void ComputePixelDepthBuffer(float *depthData, bool flipY) = 0;
 	
 	/*!
 	 * \brief Fetch occlusion culling statistics, returns zeroes if ENABLE_STATS define is
@@ -492,7 +516,12 @@ public:
 	 */
 	static void TransformVertices(const float *mtx, const float *inVtx, float *xfVtx, unsigned int nVtx, const VertexLayout &vtxLayout = VertexLayout(12, 4, 8));
 
-#if ENABLE_RECORDER
+	/*!
+	 * \brief Get used memory alloc/free callbacks.
+     */
+    void GetAllocFreeCallback( pfnAlignedAlloc & allocCallback, pfnAlignedFree & freeCallback ) { allocCallback = mAlignedAllocCallback, freeCallback = mAlignedFreeCallback; }
+
+#if MOC_RECORDER_ENABLE
     /*!
 	 * \brief Start recording subsequent rasterization and testing calls using the FrameRecorder.
      *        The function calls that are recorded are:
@@ -546,7 +575,7 @@ public:
     // merge the binned data back into original layout; in this case, call it manually from your Threadpool implementation (already added to CullingThreadpool).
     // If recording is not enabled, calling this function will do nothing.
     void RecordRenderTriangles( const float *inVtx, const unsigned int *inTris, int nTris, const float *modelToClipMatrix = nullptr, ClipPlanes clipPlaneMask = CLIP_PLANE_ALL, BackfaceWinding bfWinding = BACKFACE_CW, const VertexLayout &vtxLayout = VertexLayout( 16, 4, 12 ), CullingResult cullingResult = (CullingResult)-1 );
-#endif // #if ENABLE_RECORDER
+#endif // #if MOC_RECORDER_ENABLE
 
 protected:
 	pfnAlignedAlloc mAlignedAllocCallback;
@@ -554,10 +583,10 @@ protected:
 
 	mutable OcclusionCullingStatistics mStats;
 
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
     mutable FrameRecorder * mRecorder;
     mutable std::mutex mRecorderMutex;
-#endif // #if ENABLE_RECORDER
+#endif // #if MOC_RECORDER_ENABLE
 
 	virtual ~MaskedOcclusionCulling() {}
 };

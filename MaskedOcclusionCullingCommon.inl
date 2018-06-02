@@ -57,7 +57,7 @@ template<typename T> FORCE_INLINE T min(const T &a, const T &b) { return a < b ?
 // Maximum number of triangles that may be generated during clipping. We process SIMD_LANES triangles at a time and
 // clip against 5 planes, so the max should be 5*8 = 40 (we immediately draw the first clipped triangle).
 // This number must be a power of two.
-#define MAX_CLIPPED             64
+#define MAX_CLIPPED             (8*SIMD_LANES)
 #define MAX_CLIPPED_WRAP        (MAX_CLIPPED - 1)
 
 // Size of guard band in pixels. Clipping doesn't seem to be very expensive so we use a small guard band
@@ -71,7 +71,7 @@ template<typename T> FORCE_INLINE T min(const T &a, const T &b) { return a < b ?
 
 // Only gather statistics if enabled.
 #if ENABLE_STATS != 0
-	#define STATS_ADD(var, val)     (var) += (val)
+	#define STATS_ADD(var, val)     _InterlockedExchangeAdd64( &var, val )
 #else
 	#define STATS_ADD(var, val)
 #endif
@@ -151,7 +151,7 @@ public:
 		mMaskedHiZBuffer = nullptr;
 		mAlignedAllocCallback = alignedAlloc;
 		mAlignedFreeCallback = alignedFree;
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
         mRecorder = nullptr;
 #endif
 
@@ -173,7 +173,7 @@ public:
 			mAlignedFreeCallback(mMaskedHiZBuffer);
 		mMaskedHiZBuffer = nullptr;
 
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
         assert( mRecorder == nullptr ); // forgot to call StopRecording()?
 #endif
 	}
@@ -277,13 +277,111 @@ public:
 		memset(&mStats, 0, sizeof(OcclusionCullingStatistics));
 #endif
 
-#if ENABLE_RECORDER != 0
+#if MOC_RECORDER_ENABLE != 0
         {
             std::lock_guard<std::mutex> lock( mRecorderMutex );
             if( mRecorder != nullptr ) mRecorder->RecordClearBuffer();
         }
 #endif
 	}
+
+
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	// MergeBuffer
+	// Utility Function merges another MOC buffer into the existing one
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	void MergeBuffer(MaskedOcclusionCulling* BufferB) override
+	{
+		assert(mMaskedHiZBuffer != nullptr);
+
+		//// Iterate through all depth tiles and merge the 2 tiles
+		for (int i = 0; i < mTilesWidth * mTilesHeight; i++)
+		{
+			__mw *zMinB = ((MaskedOcclusionCullingPrivate*)BufferB)->mMaskedHiZBuffer[i].mZMin;
+			__mw *zMinA = mMaskedHiZBuffer[i].mZMin;
+			__mwi RastMaskB = ((MaskedOcclusionCullingPrivate*)BufferB)->mMaskedHiZBuffer[i].mMask;
+
+#if QUICK_MASK != 0
+			// Clear z0 to beyond infinity to ensure we never merge with clear data
+			__mwi sign0 = _mmw_srai_epi32(simd_cast<__mwi>(zMinB[0]), 31);
+			// Only merge tiles that have data in zMinB[0], use the sign bit to determine if they are still in a clear state
+			sign0 = _mmw_cmpeq_epi32(sign0, SIMD_BITS_ZERO);
+			if (!_mmw_testz_epi32(sign0, sign0))
+			{
+				STATS_ADD(mStats.mOccluders.mNumTilesMerged, 1);
+				zMinA[0] = _mmw_max_ps(zMinA[0], zMinB[0]);
+
+				__mwi rastMask = mMaskedHiZBuffer[i].mMask;
+				__mwi deadLane = _mmw_cmpeq_epi32(rastMask, SIMD_BITS_ZERO);
+				// Mask out all subtiles failing the depth test (don't update these subtiles)
+				deadLane = _mmw_or_epi32(deadLane, _mmw_srai_epi32(simd_cast<__mwi>(_mmw_sub_ps(zMinA[1], zMinA[0])), 31));
+				mMaskedHiZBuffer[i].mMask = _mmw_andnot_epi32(deadLane, rastMask);
+			}
+
+			// Set 32bit value to -1 if any pixels are set incide the coverage mask for a subtile
+			__mwi LiveTile = _mmw_cmpeq_epi32(RastMaskB, SIMD_BITS_ZERO);
+			// invert to have bits set for clear subtiles
+			__mwi t0inv = _mmw_not_epi32(LiveTile);
+			// VPTEST sets the ZF flag if all the resulting bits are 0 (ie if all tiles are clear)
+			if (!_mmw_testz_epi32(t0inv, t0inv))
+			{
+				STATS_ADD(mStats.mOccluders.mNumTilesMerged, 1);
+				UpdateTileQuick(i, RastMaskB, zMinB[1]);
+			}
+#else 
+			// Clear z0 to beyond infinity to ensure we never merge with clear data
+			__mwi sign1 = _mmw_srai_epi32(simd_cast<__mwi>(mMaskedHiZBuffer[i].mZMin[0]), 31);
+			// Only merge tiles that have data in zMinB[0], use the sign bit to determine if they are still in a clear state
+			sign1 = _mmw_cmpeq_epi32(sign1, SIMD_BITS_ZERO);
+
+			// Set 32bit value to -1 if any pixels are set incide the coverage mask for a subtile
+			__mwi LiveTile1 = _mmw_cmpeq_epi32(mMaskedHiZBuffer[i].mMask, SIMD_BITS_ZERO);
+			// invert to have bits set for clear subtiles
+			__mwi t1inv = _mmw_not_epi32(LiveTile1);
+			// VPTEST sets the ZF flag if all the resulting bits are 0 (ie if all tiles are clear)
+			if (_mmw_testz_epi32(sign1, sign1) && _mmw_testz_epi32(t1inv, t1inv))
+			{
+				mMaskedHiZBuffer[i].mMask = ((MaskedOcclusionCullingPrivate*)BufferB)->mMaskedHiZBuffer[i].mMask;
+				mMaskedHiZBuffer[i].mZMin[0] = zMinB[0];
+				mMaskedHiZBuffer[i].mZMin[1] = zMinB[1];
+			}
+			else
+			{
+				// Clear z0 to beyond infinity to ensure we never merge with clear data
+				__mwi sign0 = _mmw_srai_epi32(simd_cast<__mwi>(zMinB[0]), 31);
+				sign0 = _mmw_cmpeq_epi32(sign0, SIMD_BITS_ZERO);
+				// Only merge tiles that have data in zMinB[0], use the sign bit to determine if they are still in a clear state
+				if (!_mmw_testz_epi32(sign0, sign0))
+				{
+					// build a mask for Zmin[0], full if the layer has been completed, or partial if tile is still partly filled.
+					// cant just use the completement of the mask, as tiles might not get updated by merge 
+					__mwi sign1 = _mmw_srai_epi32(simd_cast<__mwi>(zMinB[1]), 31);
+					__mwi LayerMask0 = _mmw_not_epi32(sign1);
+					__mwi LayerMask1 = _mmw_not_epi32(((MaskedOcclusionCullingPrivate*)BufferB)->mMaskedHiZBuffer[i].mMask);
+					__mwi rastMask = _mmw_or_epi32(LayerMask0, LayerMask1);
+
+					UpdateTileAccurate(i, rastMask, zMinB[0]);
+				}
+
+				// Set 32bit value to -1 if any pixels are set incide the coverage mask for a subtile
+				__mwi LiveTile = _mmw_cmpeq_epi32(((MaskedOcclusionCullingPrivate*)BufferB)->mMaskedHiZBuffer[i].mMask, SIMD_BITS_ZERO);
+				// invert to have bits set for clear subtiles
+				__mwi t0inv = _mmw_not_epi32(LiveTile);
+				// VPTEST sets the ZF flag if all the resulting bits are 0 (ie if all tiles are clear)
+				if (!_mmw_testz_epi32(t0inv, t0inv))
+				{
+					UpdateTileAccurate(i, ((MaskedOcclusionCullingPrivate*)BufferB)->mMaskedHiZBuffer[i].mMask, zMinB[1]);
+				}
+
+				if (_mmw_testz_epi32(sign0, sign0) && _mmw_testz_epi32(t0inv, t0inv))
+					STATS_ADD(mStats.mOccluders.mNumTilesMerged, 1);
+
+			}
+
+#endif
+		}
+	}
+
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Polygon clipping functions
@@ -369,8 +467,56 @@ public:
 		TestClipPlane<ClipPlanes::CLIP_PLANE_BOTTOM>(vtxX, vtxY, vtxW, straddleMask[3], triMask, clipPlaneMask);
 		TestClipPlane<ClipPlanes::CLIP_PLANE_TOP>(vtxX, vtxY, vtxW, straddleMask[4], triMask, clipPlaneMask);
 
-		// Clip triangle against straddling planes and add to the clipped triangle buffer
+        // Clip triangle against straddling planes and add to the clipped triangle buffer
 		__m128 vtxBuf[2][8];
+
+#if CLIPPING_PRESERVES_ORDER != 0
+		unsigned int clipMask = triClipMask & triMask;
+		unsigned int clipAndStraddleMask = (straddleMask[0] | straddleMask[1] | straddleMask[2] | straddleMask[3] | straddleMask[4]) & clipMask;
+        // no clipping needed after all - early out
+        if (clipAndStraddleMask == 0)
+			return;
+		while( clipMask )
+		{
+			// Find and setup next triangle to clip
+			unsigned int triIdx = find_clear_lsb(&clipMask);
+			unsigned int triBit = (1U << triIdx);
+			assert(triIdx < SIMD_LANES);
+
+			int bufIdx = 0;
+			int nClippedVerts = 3;
+			for (int i = 0; i < 3; i++)
+				vtxBuf[0][i] = _mm_setr_ps(simd_f32(vtxX[i])[triIdx], simd_f32(vtxY[i])[triIdx], simd_f32(vtxW[i])[triIdx], 1.0f);
+
+			// Clip triangle with straddling planes. 
+			for (int i = 0; i < 5; ++i)
+			{
+				if ((straddleMask[i] & triBit) && (clipPlaneMask & (1 << i))) // <- second part maybe not needed?
+				{
+					nClippedVerts = ClipPolygon(vtxBuf[bufIdx ^ 1], vtxBuf[bufIdx], mCSFrustumPlanes[i], nClippedVerts);
+					bufIdx ^= 1;
+				}
+			}
+
+			if (nClippedVerts >= 3)
+			{
+                // Write all triangles into the clip buffer and process them next loop iteration
+				clippedTrisBuffer[clipWriteIdx * 3 + 0] = vtxBuf[bufIdx][0];
+				clippedTrisBuffer[clipWriteIdx * 3 + 1] = vtxBuf[bufIdx][1];
+				clippedTrisBuffer[clipWriteIdx * 3 + 2] = vtxBuf[bufIdx][2];
+				clipWriteIdx = (clipWriteIdx + 1) & (MAX_CLIPPED - 1);
+				for (int i = 2; i < nClippedVerts - 1; i++)
+				{
+					clippedTrisBuffer[clipWriteIdx * 3 + 0] = vtxBuf[bufIdx][0];
+					clippedTrisBuffer[clipWriteIdx * 3 + 1] = vtxBuf[bufIdx][i];
+					clippedTrisBuffer[clipWriteIdx * 3 + 2] = vtxBuf[bufIdx][i + 1];
+					clipWriteIdx = (clipWriteIdx + 1) & (MAX_CLIPPED - 1);
+				}
+			}
+		}
+        // since all triangles were copied to clip buffer for next iteration, skip further processing
+		triMask = 0;
+#else
 		unsigned int clipMask = (straddleMask[0] | straddleMask[1] | straddleMask[2] | straddleMask[3] | straddleMask[4]) & (triClipMask & triMask);
 		while (clipMask)
 		{
@@ -415,6 +561,7 @@ public:
 			else // Kill triangles that was removed by clipping
 				triMask &= ~triBit;
 		}
+#endif
 	}
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -658,7 +805,7 @@ public:
 		__mw *zMin = mMaskedHiZBuffer[tileIdx].mZMin;
 
 		// Swizzle coverage mask to 8x4 subtiles and test if any subtiles are not covered at all
-		__mwi rastMask = _mmw_transpose_epi8(coverage);
+		__mwi rastMask = coverage;
 		__mwi deadLane = _mmw_cmpeq_epi32(rastMask, SIMD_BITS_ZERO);
 
 		// Mask out all subtiles failing the depth test (don't update these subtiles)
@@ -696,7 +843,7 @@ public:
 		__mwi &mask = mMaskedHiZBuffer[tileIdx].mMask;
 
 		// Swizzle coverage mask to 8x4 subtiles
-		__mwi rastMask = _mmw_transpose_epi8(coverage);
+		__mwi rastMask = coverage;
 
 		// Perform individual depth tests with layer 0 & 1 and mask out all failing pixels 
 		__mw sdist0 = _mmw_sub_ps(zMin[0], zTriv);
@@ -822,9 +969,9 @@ public:
 					// Compute interpolated min for each 8x4 subtile and update the masked hierarchical z buffer entry
 					__mw zSubTileMin = _mmw_max_ps(z0, zTriMin);
 #if QUICK_MASK != 0
-					UpdateTileQuick(tileIdx, accumulatedMask, zSubTileMin);
+					UpdateTileQuick(tileIdx, _mmw_transpose_epi8(accumulatedMask), zSubTileMin);
 #else 
-					UpdateTileAccurate(tileIdx, accumulatedMask, zSubTileMin);
+					UpdateTileAccurate(tileIdx, _mmw_transpose_epi8(accumulatedMask), zSubTileMin);
 #endif
 				}
 			}
@@ -1360,9 +1507,9 @@ public:
 		assert(mMaskedHiZBuffer != nullptr);
 
 		if (TEST_Z)
-			STATS_ADD(mStats.mOccludees.mNumProcessedTriangles, 1);
+			STATS_ADD(mStats.mOccludees.mNumProcessedTriangles, nTris);
 		else
-			STATS_ADD(mStats.mOccluders.mNumProcessedTriangles, 1);
+			STATS_ADD(mStats.mOccluders.mNumProcessedTriangles, nTris);
 
 #if PRECISE_COVERAGE != 0
 		int originalRoundingMode = _MM_GET_ROUNDING_MODE();
@@ -1379,68 +1526,10 @@ public:
 		int triIndex = 0;
 		while (triIndex < nTris || clipHead != clipTail)
 		{
-			//////////////////////////////////////////////////////////////////////////////
-			// Assemble triangles from the index list
-			//////////////////////////////////////////////////////////////////////////////
-			__mw vtxX[3], vtxY[3], vtxW[3];
-			unsigned int triMask = SIMD_ALL_LANES_MASK, triClipMask = SIMD_ALL_LANES_MASK;
+            __mw vtxX[3], vtxY[3], vtxW[3];
+            unsigned int triMask = SIMD_ALL_LANES_MASK;
 
-			if (clipHead != clipTail)
-			{
-				int clippedTris = clipHead > clipTail ? clipHead - clipTail : MAX_CLIPPED + clipHead - clipTail;
-				clippedTris = min(clippedTris, SIMD_LANES);
-
-				// Fill out SIMD registers by fetching more triangles. 
-				numLanes = max(0, min(SIMD_LANES - clippedTris, nTris - triIndex));
-				if (numLanes > 0) {
-					if (FAST_GATHER)
-						GatherVerticesFast(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes);
-					else
-						GatherVertices(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes, vtxLayout);
-
-					TransformVerts(vtxX, vtxY, vtxW, modelToClipMatrix);
-				}
-
-				for (int clipTri = numLanes; clipTri < numLanes + clippedTris; clipTri++)
-				{
-					int triIdx = clipTail * 3;
-					for (int i = 0; i < 3; i++)
-					{
-						simd_f32(vtxX[i])[clipTri] = simd_f32(clipTriBuffer[triIdx + i])[0];
-						simd_f32(vtxY[i])[clipTri] = simd_f32(clipTriBuffer[triIdx + i])[1];
-						simd_f32(vtxW[i])[clipTri] = simd_f32(clipTriBuffer[triIdx + i])[2];
-					}
-					clipTail = (clipTail + 1) & (MAX_CLIPPED-1);
-				}
-
-				triIndex += numLanes;
-				inTrisPtr += numLanes * 3;
-
-				triMask = (1U << (clippedTris + numLanes)) - 1;
-				triClipMask = (1U << numLanes) - 1; // Don't re-clip already clipped triangles
-			}
-			else
-			{
-				numLanes = min(SIMD_LANES, nTris - triIndex);
-				triMask = (1U << numLanes) - 1;
-				triClipMask = triMask;
-
-				if (FAST_GATHER)
-					GatherVerticesFast(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes);
-				else
-					GatherVertices(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes, vtxLayout);
-
-				TransformVerts(vtxX, vtxY, vtxW, modelToClipMatrix);
-				triIndex += SIMD_LANES;
-				inTrisPtr += SIMD_LANES*3;
-			}
-
-			//////////////////////////////////////////////////////////////////////////////
-			// Clip transformed triangles
-			//////////////////////////////////////////////////////////////////////////////
-
-			if (clipPlaneMask != ClipPlanes::CLIP_PLANE_NONE)
-				ClipTriangleAndAddToBuffer(vtxX, vtxY, vtxW, clipTriBuffer, clipHead, triMask, triClipMask, clipPlaneMask);
+            GatherTransformClip<FAST_GATHER>( clipHead, clipTail, numLanes, nTris, triIndex, vtxX, vtxY, vtxW, inVtx, inTrisPtr, vtxLayout, modelToClipMatrix, clipTriBuffer, triMask, clipPlaneMask );
 
 			if (triMask == 0x0)
 				continue;
@@ -1508,7 +1597,7 @@ public:
         else
             retVal = (CullingResult)RenderTriangles<0, 0>(inVtx, inTris, nTris, modelToClipMatrix, bfWinding, clipPlaneMask, vtxLayout);
 
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
         RecordRenderTriangles( inVtx, inTris, nTris, modelToClipMatrix, clipPlaneMask, bfWinding, vtxLayout, retVal );
 #endif
 		return retVal;
@@ -1527,7 +1616,7 @@ public:
         else
 		    retVal = (CullingResult)RenderTriangles<1, 0>(inVtx, inTris, nTris, modelToClipMatrix, bfWinding, clipPlaneMask, vtxLayout);
 
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
         {
             std::lock_guard<std::mutex> lock( mRecorderMutex );
             if( mRecorder != nullptr ) mRecorder->RecordTestTriangles( retVal, inVtx, inTris, nTris, modelToClipMatrix, clipPlaneMask, bfWinding, vtxLayout );
@@ -1568,7 +1657,7 @@ public:
 
 		if (simd_i32(tileBBoxi)[0] == simd_i32(tileBBoxi)[1] || simd_i32(tileBBoxi)[2] == simd_i32(tileBBoxi)[3])
         {
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
             {
                 std::lock_guard<std::mutex> lock( mRecorderMutex );
                 if( mRecorder != nullptr ) mRecorder->RecordTestRect( CullingResult::VIEW_CULLED, xmin, ymin, xmax, ymax, wmin );
@@ -1627,7 +1716,7 @@ public:
 				// If not all tiles failed the conservative z test we can immediately terminate the test
 				if (!_mmw_testz_epi32(zPass, zPass))
                 {
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
                     {
                         std::lock_guard<std::mutex> lock( mRecorderMutex );
                         if( mRecorder != nullptr ) mRecorder->RecordTestRect( CullingResult::VISIBLE, xmin, ymin, xmax, ymax, wmin );
@@ -1646,7 +1735,7 @@ public:
 				break;
 			pixelY = _mmw_add_epi32(pixelY, _mmw_set1_epi32(TILE_HEIGHT));
 		}
-#if ENABLE_RECORDER
+#if MOC_RECORDER_ENABLE
         {
             std::lock_guard<std::mutex> lock( mRecorderMutex );
             if( mRecorder != nullptr ) mRecorder->RecordTestRect( CullingResult::OCCLUDED, xmin, ymin, xmax, ymax, wmin );
@@ -1665,6 +1754,8 @@ public:
 		_MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
 #endif
 
+		STATS_ADD(mStats.mOccluders.mNumProcessedTriangles, nTris);
+
 		int clipHead = 0;
 		int clipTail = 0;
 		__m128 clipTriBuffer[MAX_CLIPPED * 3];
@@ -1674,69 +1765,10 @@ public:
 		int triIndex = 0;
 		while (triIndex < nTris || clipHead != clipTail)
 		{
-			//////////////////////////////////////////////////////////////////////////////
-			// Assemble triangles from the index list 
-			//////////////////////////////////////////////////////////////////////////////
-			__mw vtxX[3], vtxY[3], vtxW[3];
-			unsigned int triMask = SIMD_ALL_LANES_MASK, triClipMask = SIMD_ALL_LANES_MASK;
+            unsigned int triMask = SIMD_ALL_LANES_MASK;
+            __mw vtxX[3], vtxY[3], vtxW[3];
 
-			if (clipHead != clipTail)
-			{
-				int clippedTris = clipHead > clipTail ? clipHead - clipTail : MAX_CLIPPED + clipHead - clipTail;
-				clippedTris = min(clippedTris, SIMD_LANES);
-
-				// Fill out SIMD registers by fetching more triangles. 
-				numLanes = max(0, min(SIMD_LANES - clippedTris, nTris - triIndex));
-				if (numLanes > 0) {
-					if (FAST_GATHER)
-						GatherVerticesFast(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes);
-					else
-						GatherVertices(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes, vtxLayout);
-
-					TransformVerts(vtxX, vtxY, vtxW, modelToClipMatrix);
-				}
-
-				for (int clipTri = numLanes; clipTri < numLanes + clippedTris; clipTri++)
-				{
-					int triIdx = clipTail * 3;
-					for (int i = 0; i < 3; i++)
-					{
-						simd_f32(vtxX[i])[clipTri] = simd_f32(clipTriBuffer[triIdx + i])[0];
-						simd_f32(vtxY[i])[clipTri] = simd_f32(clipTriBuffer[triIdx + i])[1];
-						simd_f32(vtxW[i])[clipTri] = simd_f32(clipTriBuffer[triIdx + i])[2];
-					}
-					clipTail = (clipTail + 1) & (MAX_CLIPPED - 1);
-				}
-
-				triIndex += numLanes;
-				inTrisPtr += numLanes * 3;
-
-				triMask = (1U << (clippedTris + numLanes)) - 1;
-				triClipMask = (1U << numLanes) - 1; // Don't re-clip already clipped triangles
-			}
-			else
-			{
-				numLanes = min(SIMD_LANES, nTris - triIndex);
-				triMask = (1U << numLanes) - 1;
-				triClipMask = triMask;
-
-				if (FAST_GATHER)
-					GatherVerticesFast(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes);
-				else
-					GatherVertices(vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes, vtxLayout);
-
-				TransformVerts(vtxX, vtxY, vtxW, modelToClipMatrix);
-
-				triIndex += SIMD_LANES;
-				inTrisPtr += SIMD_LANES * 3;
-			}
-
-			//////////////////////////////////////////////////////////////////////////////
-			// Clip transformed triangles
-			//////////////////////////////////////////////////////////////////////////////
-
-			if (clipPlaneMask != ClipPlanes::CLIP_PLANE_NONE)
-				ClipTriangleAndAddToBuffer(vtxX, vtxY, vtxW, clipTriBuffer, clipHead, triMask, triClipMask, clipPlaneMask);
+            GatherTransformClip<FAST_GATHER>( clipHead, clipTail, numLanes, nTris, triIndex, vtxX, vtxY, vtxW, inVtx, inTrisPtr, vtxLayout, modelToClipMatrix, clipTriBuffer, triMask, clipPlaneMask );
 
 			if (triMask == 0x0)
 				continue;
@@ -1829,6 +1861,82 @@ public:
 			BinTriangles<false>(inVtx, inTris, nTris, triLists, nBinsW, nBinsH, modelToClipMatrix, bfWinding, clipPlaneMask, vtxLayout);
 	}
 
+    template<int FAST_GATHER>
+    void GatherTransformClip( int & clipHead, int & clipTail, int & numLanes, int nTris, int & triIndex, __mw * vtxX, __mw * vtxY, __mw * vtxW, const float * inVtx, const unsigned int * &inTrisPtr, const VertexLayout & vtxLayout, const float * modelToClipMatrix, __m128 * clipTriBuffer, unsigned int &triMask, ClipPlanes clipPlaneMask )
+    {
+        //////////////////////////////////////////////////////////////////////////////
+        // Assemble triangles from the index list 
+        //////////////////////////////////////////////////////////////////////////////
+        unsigned int triClipMask = SIMD_ALL_LANES_MASK;
+
+        if( clipHead != clipTail )
+        {
+            int clippedTris = clipHead > clipTail ? clipHead - clipTail : MAX_CLIPPED + clipHead - clipTail;
+            clippedTris = min( clippedTris, SIMD_LANES );
+
+#if CLIPPING_PRESERVES_ORDER != 0
+            // if preserving order, don't mix clipped and new triangles, handle the clip buffer fully
+            // and then continue gathering; this is not as efficient - ideally we want to gather
+            // at the end (if clip buffer has less than SIMD_LANES triangles) but that requires
+            // more modifications below - something to do in the future.
+            numLanes = 0;
+#else
+            // Fill out SIMD registers by fetching more triangles. 
+            numLanes = max( 0, min( SIMD_LANES - clippedTris, nTris - triIndex ) );
+#endif
+
+            if( numLanes > 0 ) {
+                if( FAST_GATHER )
+                    GatherVerticesFast( vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes );
+                else
+                    GatherVertices( vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes, vtxLayout );
+
+                TransformVerts( vtxX, vtxY, vtxW, modelToClipMatrix );
+            }
+
+            for( int clipTri = numLanes; clipTri < numLanes + clippedTris; clipTri++ )
+            {
+                int triIdx = clipTail * 3;
+                for( int i = 0; i < 3; i++ )
+                {
+                    simd_f32( vtxX[i] )[clipTri] = simd_f32( clipTriBuffer[triIdx + i] )[0];
+                    simd_f32( vtxY[i] )[clipTri] = simd_f32( clipTriBuffer[triIdx + i] )[1];
+                    simd_f32( vtxW[i] )[clipTri] = simd_f32( clipTriBuffer[triIdx + i] )[2];
+                }
+                clipTail = ( clipTail + 1 ) & ( MAX_CLIPPED - 1 );
+            }
+
+            triIndex += numLanes;
+            inTrisPtr += numLanes * 3;
+
+            triMask = ( 1U << ( clippedTris + numLanes ) ) - 1;
+            triClipMask = ( 1U << numLanes ) - 1; // Don't re-clip already clipped triangles
+        }
+        else
+        {
+            numLanes = min( SIMD_LANES, nTris - triIndex );
+            triMask = ( 1U << numLanes ) - 1;
+            triClipMask = triMask;
+
+            if( FAST_GATHER )
+                GatherVerticesFast( vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes );
+            else
+                GatherVertices( vtxX, vtxY, vtxW, inVtx, inTrisPtr, numLanes, vtxLayout );
+
+            TransformVerts( vtxX, vtxY, vtxW, modelToClipMatrix );
+
+            triIndex += SIMD_LANES;
+            inTrisPtr += SIMD_LANES * 3;
+        }
+
+        //////////////////////////////////////////////////////////////////////////////
+        // Clip transformed triangles
+        //////////////////////////////////////////////////////////////////////////////
+
+        if( clipPlaneMask != ClipPlanes::CLIP_PLANE_NONE )
+            ClipTriangleAndAddToBuffer( vtxX, vtxY, vtxW, clipTriBuffer, clipHead, triMask, triClipMask, clipPlaneMask );
+    }
+
 	void RenderTrilist(const TriList &triList, const ScissorRect *scissor) override
 	{
 		assert(mMaskedHiZBuffer != nullptr);
@@ -1901,7 +2009,7 @@ public:
 		return gInstructionSet;
 	}
 
-	void ComputePixelDepthBuffer(float *depthData) override
+	void ComputePixelDepthBuffer(float *depthData, bool flipY) override
 	{
 		assert(mMaskedHiZBuffer != nullptr);
 		for (int y = 0; y < mHeight; y++)
@@ -1926,11 +2034,10 @@ public:
 				int pixelLayer = (simd_i32(mMaskedHiZBuffer[tileIdx].mMask)[subTileIdx] >> bitIdx) & 1;
 				float pixelDepth = simd_f32(mMaskedHiZBuffer[tileIdx].mZMin[pixelLayer])[subTileIdx];
 
-#if USE_D3D != 0
-                depthData[( mHeight - y - 1 ) * mWidth + x] = pixelDepth;
-#else
-                depthData[y * mWidth + x] = pixelDepth;
-#endif
+                if( flipY )
+                    depthData[( mHeight - y - 1 ) * mWidth + x] = pixelDepth;
+                else
+                    depthData[y * mWidth + x] = pixelDepth;
 			}
 		}
 	}

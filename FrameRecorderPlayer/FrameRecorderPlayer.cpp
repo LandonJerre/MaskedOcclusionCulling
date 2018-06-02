@@ -30,8 +30,12 @@
 #include "../MaskedOcclusionCulling.h"
 #include "../FrameRecorder.h"
 
-#if !ENABLE_RECORDER
-#error This project needs to be compiled with ENABLE_RECORDER set to 1
+#if !MOC_RECORDER_ENABLE
+#error This project needs to be compiled with MOC_RECORDER_ENABLE set to 1
+#endif
+
+#if !MOC_RECORDER_ENABLE_PLAYBACK
+#error This project needs to be compiled with MOC_RECORDER_ENABLE_PLAYBACK set to 1
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -345,7 +349,7 @@ int main(int argc, char* argv[])
 
         // Compute a per pixel depth buffer from the hierarchical depth buffer, used for visualization.
         float *perPixelZBuffer = new float[width * height];
-        moc->ComputePixelDepthBuffer( perPixelZBuffer );
+        moc->ComputePixelDepthBuffer( perPixelZBuffer, true );
 
         // Tonemap the image
         unsigned char *image = new unsigned char[width * height * 3];
